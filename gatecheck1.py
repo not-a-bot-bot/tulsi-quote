@@ -63,10 +63,14 @@ class APIResp(BaseModel):
 
 def create_inventory(path: Path) -> tuple[list[InquiryLine], int]:
     inventory = []
+    REQUIRED = {"part_code", "qty", "currency", "unit_price_foreign"}
     ct = 0
     try:
         with open(path, "r") as f:
             file = csv.DictReader(f, skipinitialspace = True)
+            if file.fieldnames is None or not REQUIRED.issubset(file.fieldnames):
+                logger.error(f"CSV is missing required columns. Expected {sorted(REQUIRED)}, found {file.fieldnames}")
+                return None, ...
             for i, line in enumerate(file, start=2):
                 try:
                     valid_line = InquiryLine(**line)
@@ -151,12 +155,13 @@ async def fetch_rate(client: httpx.AsyncClient, url: str, limit: asyncio.Semapho
         resp.raise_for_status()
         return APIResp(**resp.json())
 
-async def call_curr_exc(unique_curr: list, concurrency: int = 3) -> list:
+async def call_curr_exc(unique_curr: list, concurrency: int = 3) -> tuple[list, int]:
     tout = httpx.Timeout(connect = 5, read = 30, write = 10, pool = 5)
     url = os.environ.get("FX_BASE_URL")
     # url = "https://api.frankfurter.dev/v1/"
     limit = asyncio.Semaphore(concurrency)
     results = []
+    ct = 0
     async with httpx.AsyncClient(timeout = tout) as client:
         result = await asyncio.gather(
             *(fetch_rate(client, url, limit, curr) for curr in unique_curr),
@@ -167,11 +172,12 @@ async def call_curr_exc(unique_curr: list, concurrency: int = 3) -> list:
                 if isinstance(resp, Exception):
                     raise RateFetchError(f"No rate for {unique_curr[id]} due to {type(resp).__name__}") from resp
                 results.append(resp)
+                ct += 1
                 logger.info(f"{resp.base} to INR exchange rate fetched = {resp.rates['INR']}.")
             except RateFetchError:
                 logger.exception(f"Rate fetch failed.")
                 # results.append(resp)
-    return results
+    return results, ct
 
 def mapped_rate(inventory: list, curr_rates: list) -> tuple[Quotation, int]:
     rate_dict = {}
@@ -250,7 +256,12 @@ async def body():
 
     # main function runs
     unique_curr = create_unique_set(inventory)
-    curr_rates = await call_curr_exc(unique_curr, concurrency = concur)
+    curr_rates, ct = await call_curr_exc(unique_curr, concurrency = concur)
+    if ct == 0:
+        logger.error(f"No valid rows found. Exiting.")
+        return 1
+    if ct < len(inventory):
+        return_status = 2
     inr_prices, valid_curr = mapped_rate(inventory, curr_rates)
     discounted_prices = apply_discount(inr_prices, discount = disc)
     post_tax_prices = [item.model_copy(update = {"rate_in_inr": item.rate_in_inr * (1 + gst/100.0), "amount": item.amount * (1 + gst/100.0)}) for item in discounted_prices]
