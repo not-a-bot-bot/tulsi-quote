@@ -9,17 +9,8 @@ import argparse
 
 logger = logging.getLogger(__name__)
 
-class ItemError(Exception):
-    "Main exception for entire module."
-    pass
-
-class InvalidPartCodeError(ItemError):
-    # logger.ERROR(f"Invalid part code: {Exception}")
-    pass
-
-class InvalidCurrencySymbol(ItemError):
-    # logger.ERROR(f"Invalid currency symbol: {Exception}")
-    pass
+class RateFetchError(Exception):
+    """"A currency's exchange rate could not be retrieved."""
 
 class InquiryLine(BaseModel):
     part_code: str
@@ -68,9 +59,9 @@ class APIResp(BaseModel):
     amount: float
     base: str
     date: date
-    rates: dict
+    rates: dict[str, float]
 
-def create_inventory(path: str) -> tuple:
+def create_inventory(path: Path) -> tuple[list[InquiryLine], int]:
     inventory = []
     ct = 0
     try:
@@ -85,17 +76,20 @@ def create_inventory(path: str) -> tuple:
                     for e in exc.errors():
                         logger.warning(f"Inquiry line {i}: {e['msg']} error for {e['loc'][0]} = {e['input']}, line skipped.")
                     continue
+            if inventory == []:
+                logger.error(f"No rows found in the csv.")
+                return None, 1
             logger.info(f"Total {len(inventory) + ct} lines processed, out of which {ct} lines skipped due to incorrect data or inconsistent formatting.")
             return inventory, ct
     except FileNotFoundError:
-        return None, 0
-    if inventory == []:
-        return None, 0
+        logger.error(f"File not found at the specified path.")
+        return None, None
 
 def create_unique_set(inv: list) -> list:
     unique_curr = set()
     for item in inv:
-        unique_curr.add(item.currency)
+        if item.currency != "INR":
+            unique_curr.add(item.currency)
     logger.info(f"The inquiry has {len(unique_curr)} number of unique currency items.")
     return list(unique_curr)
 
@@ -115,12 +109,12 @@ def retry_after(exc: Exception) -> float:
     if header is not None:
         try:
             return float(header)
-        except:
+        except (TypeError, ValueError):
             pass
         try:
             dt = parsedate_to_datetime(header)
             return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
-        except:
+        except (TypeError, ValueError):
             return None
     return None
 
@@ -147,45 +141,42 @@ def async_retry(max_attempt:int = 3, base_delay: float = 0.5, max_delay: float =
                         tot_delay = min(max_delay, base_delay * (2 ** attempt))
                         delay = random.uniform(0, tot_delay)
                     await asyncio.sleep(delay)
-        # print("Wrapper type", type(wrapper))
         return wrapper
-    # print("Decorator type", type(decorator))
     return decorator
 
 @async_retry()
-async def fetch_rate(client: httpx.AsyncClient, url: str, limit: int, base_curr: str, date = "latest") -> APIResp:   ### i don't know what's the returned APIResp datatype
+async def fetch_rate(client: httpx.AsyncClient, url: str, limit: asyncio.Semaphore, base_curr: str, date = "latest") -> APIResp:   ### i don't know what's the returned APIResp datatype
     async with limit:
         resp = await client.get(f"{url}{date}?base={base_curr}&symbols=INR")
         resp.raise_for_status()
-        # print("API type", type(APIResp(**resp.json())))
         return APIResp(**resp.json())
 
 async def call_curr_exc(unique_curr: list, concurrency: int = 3) -> list:
     tout = httpx.Timeout(connect = 5, read = 30, write = 10, pool = 5)
-    url = "https://api.frankfurter.dev/v1/"
+    url = os.environ.get("FX_BASE_URL")
+    # url = "https://api.frankfurter.dev/v1/"
     limit = asyncio.Semaphore(concurrency)
     results = []
     async with httpx.AsyncClient(timeout = tout) as client:
         result = await asyncio.gather(
-            *(fetch_rate(client, url, limit, curr) for curr in unique_curr if curr != 'INR'),
+            *(fetch_rate(client, url, limit, curr) for curr in unique_curr),
             return_exceptions = True
         )
         for id, resp in enumerate(result):
-            if isinstance(resp, Exception):
-                logger.error(f"{unique_curr[id]} currency failed due to {type(resp).__name__}")
-                continue
-            else:
-                logger.info(f"{resp.base} to INR exchange rate fetched = {resp.rates['INR']}.")
+            try:
+                if isinstance(resp, Exception):
+                    raise RateFetchError(f"No rate for {unique_curr[id]} due to {type(resp).__name__}") from resp
                 results.append(resp)
+                logger.info(f"{resp.base} to INR exchange rate fetched = {resp.rates['INR']}.")
+            except RateFetchError:
+                logger.exception(f"Rate fetch failed.")
+                # results.append(resp)
     return results
 
-def mapped_rate(inventory: list, curr_rates: list) -> tuple:
+def mapped_rate(inventory: list, curr_rates: list) -> tuple[Quotation, int]:
     rate_dict = {}
     quotation = Quotation()
     for curr in curr_rates:
-        if isinstance(curr, httpx.HTTPStatusError):
-            logger.warning(f"Failed to fetch currency rate for {curr}.")
-            continue
         rates = curr.rates
         rate_dict[curr.base] = rates['INR']
     valid_curr = len(rate_dict)
@@ -215,39 +206,44 @@ async def body():
     load_dotenv(find_dotenv())
 
     # fetching from .env file
-    file_path = os.environ.get("FILE_PATH")
-    file_name = Path(file_path)/"nc-singrauli.csv"
-    write_path = os.environ.get("WRITE_PATH")
+    # file_path = os.environ.get("FILE_PATH")
+    # file_name = Path(file_path)/"nc-singrauli.csv"
+    # write_path = os.environ.get("WRITE_PATH")
     log_path = Path(os.environ.get("LOG_PATH"))
     logging.basicConfig(filename = log_path, level = logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
     
     gst = float(os.environ.get("GST"))
 
     # reading from input arguments
-    parser.add_argument("--discount", help="Mention the discount percentage for this quote.", type=float)
-    parser.add_argument("--out", help="Specify the output path for this quote.", type=str)
-    parser.add_argument("--concur", help="Give max concurrent workers for processing this quote.", type=int)
+    parser.add_argument("input", help="Path to inquiry csv.", type = Path)
+    parser.add_argument("--out", help="Specify the output file name for the quote.", type=Path, default = "./quotes")
+    parser.add_argument("--discount", help="Mention the discount percentage for this quote.", type=float, default = 0.0)
+    parser.add_argument("--concur", help="Give max concurrent workers for processing this quote.", type=int, default=3)
     args = parser.parse_args()
     disc = args.discount
     concur = args.concur
-    dt = datetime.today().date()
-    if args.out is None:
-        logger.error(f"Need an output path.")
+    if args.input is None:
+        logger.error(f"Need an input inquiry csv path.")
         return 1
-    out_file_name = args.out + "-" + str(dt) + ".json"
-    write_file = Path(write_path)/out_file_name
+    input_path = args.input
+    args.out.mkdir(parents=True, exist_ok=True)
+    out_file_name = f"{args.input.stem}-{date.today()}.json"
+    write_file = args.out/out_file_name
     return_status = 0
 
     # basic checks
     if disc < 0 or disc > 100:
         logger.error(f"Incorrect input: Discount must be 0-100.")
         return 1
-    if type(concur) != int and concur < 1:
+    if type(concur) != int or concur < 1:
         logger.error(f"Incorrect input: Concurrency must be a positive integer.")
         return 1
-    inventory, ct = create_inventory(file_name)
+    inventory, ct = create_inventory(input_path)
     if inventory is None:
-        logger.error(f"File not found at specified location. Exiting.")
+        if ct is None:
+            logger.error(f"File not found at specified location. Exiting.")
+        else:
+            logger.error(f"Inquiry csv is empty. Exiting.")
         return 1
     elif ct > 0:
         return_status = 2
@@ -269,12 +265,12 @@ async def body():
     print(f"Out of {len(inventory) + ct} items in the quotation, {ct} items were skipped due to inconsistent values - either incorrect part_code, less than 1 quantity or non-positive unit_price.")
     print(f"Amongst the {len(inventory)} items, there were {len(unique_curr)} unique currency codes, out of which {valid_curr} were valid currencies whose exchange rates were fetched from the API.")
     print(f"A discount of {disc}% was applied and additional {gst}% GST was levied as tax.")
-    print(f"The final price in INR rates after discount and taxation is INR {tot_price}, and the quotation is stored at Quotation.json.")
+    print(f"The final price in INR rates after discount and taxation is INR {tot_price}, and the quotation is stored at {write_file}.")
     
     return return_status
 
 
 if __name__ == "__main__":
-    asyncio.run(body())
+    raise SystemExit(asyncio.run(body()))
 
 
