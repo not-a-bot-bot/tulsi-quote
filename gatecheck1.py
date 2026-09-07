@@ -7,6 +7,8 @@ from pathlib import Path
 from dotenv import load_dotenv, find_dotenv
 import argparse
 
+logger = logging.getLogger(__name__)
+
 class ItemError(Exception):
     "Main exception for entire module."
     pass
@@ -211,7 +213,6 @@ def apply_discount(raw_prices: list, discount:float = 0.0) -> Quotation:
 async def body():
     parser = argparse.ArgumentParser()
     load_dotenv(find_dotenv())
-    global logger
 
     # fetching from .env file
     file_path = os.environ.get("FILE_PATH")
@@ -219,7 +220,7 @@ async def body():
     write_path = os.environ.get("WRITE_PATH")
     log_path = Path(os.environ.get("LOG_PATH"))
     logging.basicConfig(filename = log_path, level = logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
-    logger = logging.getLogger(__name__)
+    
     gst = float(os.environ.get("GST"))
 
     # reading from input arguments
